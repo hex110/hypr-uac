@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""hypr-uac — the single elevation/authentication prompt for this desktop.
+
+Callers:
+  * /etc/pam.d/sudo, via hypr-uac-pam — Yes/No consent, no password.
+  * SUDO_ASKPASS / SSH_ASKPASS, via ~/.local/bin/hypr-askpass — a password
+    entry, or a Yes/No when ssh is asking a yes/no question (host keys).
+
+Modes:
+  --mode confirm   Yes/No.
+  --mode password  Password entry; the secret goes to stdout.
+A bare positional argument is the askpass calling convention: ssh and sudo
+both pass the prompt as argv[1] and read the answer from stdout, with no
+indication of which kind of question it is, so it is classified here.
+
+Exit codes, which the PAM helper depends on telling apart:
+  0  allowed (or an answer was produced)
+  1  refused by the user
+  2  could not ask — no display, toolkit failure; the caller should fall
+     back to its own password prompt rather than treat this as a refusal.
+
+A real xdg_toplevel, so Hyprland can float it like any other window rather
+than it being an always-on-top layer surface. GTK4 + libadwaita means it
+inherits the system colour-scheme, font and ~/.config/gtk-4.0/gtk.css, which
+is what the active shell profile writes — so it re-themes itself when the
+profile changes, with no colours hardcoded here.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
+
+APP_ID = "hypr-uac"
+
+# The window is not resizable, so it sizes to its content: every label needs a
+# width cap or one long line (a full command line, an ssh prompt) stretches the
+# whole dialog across the screen instead of wrapping.
+WIDTH = 440
+HEADING_CHARS = 28
+DETAIL_CHARS = 42
+BLOCK_CHARS = 44
+
+# Unanswered prompts are refused rather than left hanging. Overridable only to
+# make the refusal path testable: a shorter timeout can deny, never allow, and
+# PAM scrubs the environment anyway.
+try:
+    TIMEOUT_SECONDS = max(1, int(os.environ.get("HYPR_UAC_TIMEOUT", "60")))
+except ValueError:
+    TIMEOUT_SECONDS = 60
+
+# ssh asks its yes/no questions through the same askpass interface as
+# passwords. The answer must be the literal word, not an exit code.
+YES_NO_PROMPT = re.compile(r"\(yes/no(/\[fingerprint\])?\)|\(yes/no\)", re.I)
+
+CSS = """
+.uac-icon { -gtk-icon-size: 52px; }
+.uac-detail-box {
+    font-family: monospace;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: alpha(currentColor, 0.06);
+}
+"""
+
+
+class UacWindow(Adw.ApplicationWindow):
+    def __init__(self, app, args):
+        super().__init__(application=app, title=args.title)
+        self.args = args
+        self.entry = None
+
+        self.set_resizable(False)
+        self.set_default_size(WIDTH, -1)
+        self.set_size_request(WIDTH, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(box)
+
+        header = Adw.HeaderBar(show_end_title_buttons=False,
+                               show_start_title_buttons=False)
+        header.add_css_class("flat")
+        box.append(header)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        body.set_margin_top(4)
+        body.set_margin_bottom(20)
+        body.set_margin_start(24)
+        body.set_margin_end(24)
+        box.append(body)
+
+        icon = Gtk.Image.new_from_icon_name(args.icon)
+        icon.add_css_class("uac-icon")
+        icon.add_css_class("accent")
+        body.append(icon)
+
+        heading = Gtk.Label(label=args.heading, wrap=True,
+                            wrap_mode=Pango.WrapMode.WORD_CHAR,
+                            max_width_chars=HEADING_CHARS,
+                            justify=Gtk.Justification.CENTER)
+        heading.add_css_class("title-2")
+        body.append(heading)
+
+        if args.detail:
+            detail = Gtk.Label(label=args.detail, wrap=True,
+                               wrap_mode=Pango.WrapMode.WORD_CHAR,
+                               max_width_chars=DETAIL_CHARS,
+                               justify=Gtk.Justification.CENTER)
+            detail.add_css_class("dim-label")
+            body.append(detail)
+
+        if args.command:
+            # WORD_CHAR so an unbroken token -- a long path -- breaks mid-word
+            # rather than forcing the window wider.
+            cmd = Gtk.Label(label=args.command, wrap=True,
+                            wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=True,
+                            xalign=0.0, max_width_chars=BLOCK_CHARS)
+            cmd.set_hexpand(False)
+            cmd.add_css_class("uac-detail-box")
+            cmd.add_css_class("caption")
+            body.append(cmd)
+
+        if args.mode == "password":
+            self.entry = Gtk.PasswordEntry(show_peek_icon=True,
+                                           activates_default=True)
+            self.entry.set_margin_top(4)
+            body.append(self.entry)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
+                          homogeneous=True)
+        buttons.set_margin_top(6)
+        body.append(buttons)
+
+        deny = Gtk.Button(label=args.deny_label)
+        deny.connect("clicked", lambda _b: self.finish(None))
+        buttons.append(deny)
+
+        allow = Gtk.Button(label=args.allow_label)
+        allow.add_css_class("suggested-action")
+        allow.connect("clicked", lambda _b: self.confirm())
+        buttons.append(allow)
+
+        allow.set_receives_default(True)
+        self.set_default_widget(allow)
+        (self.entry or allow).grab_focus()
+
+        esc = Gtk.ShortcutController()
+        esc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.ShortcutTrigger.parse_string("Escape"),
+            Gtk.CallbackAction.new(lambda *_a: self.finish(None) or True)))
+        self.add_controller(esc)
+
+        self.connect("close-request", lambda _w: self.finish(None) or True)
+        GLib.timeout_add_seconds(TIMEOUT_SECONDS, lambda: self.finish(None))
+
+    def confirm(self):
+        self.finish(self.entry.get_text() if self.entry else "")
+
+    def finish(self, result):
+        app = self.get_application()
+        if app:
+            app.result = result
+        self.set_application(None)
+        self.destroy()
+        if app:
+            app.quit()
+        return GLib.SOURCE_REMOVE
+
+
+class UacApp(Adw.Application):
+    def __init__(self, args):
+        super().__init__(application_id=None, flags=0)
+        GLib.set_prgname(APP_ID)
+        GLib.set_application_name("Administrator access")
+        self.args = args
+        self.result = None
+        self.presented = False
+
+    def do_activate(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        display = Gdk.Display.get_default()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        UacWindow(self, self.args).present()
+        self.presented = True
+
+
+def classify_askpass_prompt(args):
+    """Turn an askpass prompt into a filled-in dialog spec.
+
+    Returns True when the answer must be the word "yes"/"no" on stdout
+    rather than an exit code, which is how ssh asks about host keys.
+    """
+    prompt = args.prompt.strip()
+
+    if YES_NO_PROMPT.search(prompt):
+        # Multi-line: the last line is the question, the rest is evidence
+        # (host name, key fingerprint) that belongs in the monospace block.
+        lines = [l for l in prompt.splitlines() if l.strip()]
+        args.mode = "confirm"
+        # The literal "(yes/no/[fingerprint])" is ssh telling a terminal user
+        # what to type; the buttons say it better.
+        question = lines[-1] if lines else "Continue?"
+        args.heading = re.sub(r"\s*\(yes/no(/\[fingerprint\])?\)", "", question)
+        args.title = "Host verification"
+        args.detail = None
+        args.command = "\n".join(lines[:-1]) or None
+        args.icon = "dialog-question-symbolic"
+        args.allow_label, args.deny_label = "Yes", "No"
+        return True
+
+    args.mode = "password"
+    args.title = "Authentication"
+    args.heading = "Authentication required"
+    args.detail = prompt.rstrip(":")
+    args.icon = "dialog-password-symbolic"
+    args.allow_label, args.deny_label = "Authenticate", "Cancel"
+    return False
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--mode", choices=("confirm", "password"), default="confirm")
+    p.add_argument("--heading")
+    p.add_argument("--detail")
+    p.add_argument("--command")
+    p.add_argument("prompt", nargs="?")
+    args = p.parse_args()
+
+    args.icon = "dialog-password-symbolic"
+    args.title = "Administrator access"
+    args.allow_label = "Yes" if args.mode == "confirm" else "Authenticate"
+    args.deny_label = "No" if args.mode == "confirm" else "Cancel"
+
+    answer_in_words = False
+    if args.prompt and not args.heading:
+        answer_in_words = classify_askpass_prompt(args)
+
+    if not args.heading:
+        args.heading = ("Allow administrator access?" if args.mode == "confirm"
+                        else "Authentication required")
+
+    app = UacApp(args)
+    try:
+        app.run([])
+    except Exception as exc:  # noqa: BLE001 — any failure here means "could not ask"
+        print(f"hypr-uac: {exc}", file=sys.stderr)
+        return 2
+    if not app.presented:
+        print("hypr-uac: no window was shown", file=sys.stderr)
+        return 2
+
+    if answer_in_words:
+        # Closing the window is a refusal, and ssh wants that spelled out.
+        sys.stdout.write("yes\n" if app.result is not None else "no\n")
+        return 0
+    if args.mode == "confirm":
+        return 0 if app.result is not None else 1
+    if app.result is None:
+        return 1
+    sys.stdout.write(app.result + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,68 @@
+/* Optional companion to the yes/no sudo prompt. NOT installed by install.sh:
+ * read it, edit the user name, and copy it yourself.
+ *
+ *   sudo install -m 644 examples/polkit/49-hypr-uac-desktop.rules \
+ *        /etc/polkit-1/rules.d/49-hypr-uac-desktop.rules
+ *
+ * Why a rule and not the consent dialog: polkit cannot show it. Both
+ * polkitd and polkit-agent-helper@.service run under systemd sandboxing with
+ * ProtectHome=yes, which makes /home, /root AND /run/user inaccessible, so
+ * neither can reach your Wayland session to draw anything -- not by spawning
+ * a dialog, and not by handing off to a session daemon over a socket. The
+ * only way around it is to weaken the sandbox on the component that performs
+ * authentication, which is a bad trade. So for polkit the choice is password
+ * or nothing, with no consent step in between.
+ *
+ * That is why the list below is drawn where it is: BOUNDED operations, where
+ * the worst case is a known, recoverable action on a known object. Anything
+ * granting GENERAL-PURPOSE ROOT is deliberately absent, because with no
+ * prompt it would be a silent path to a root shell -- a strictly weaker gate
+ * than the sudo dialog, not an equal one. Those keep their password:
+ *
+ *   org.freedesktop.policykit.exec                 pkexec <any command>
+ *   org.freedesktop.systemd1.manage-unit[-file]s   start/stop any unit
+ *   org.freedesktop.udisks2.modify-system-configuration, filesystem-fstab
+ *   any vendor "run this whole app as root" / "open a root terminal" action
+ *
+ * Check any action before adding it, without triggering a prompt:
+ *   pkcheck --action-id <id> --process $$ ; echo $?
+ */
+
+/* CHANGE THIS to your user name. */
+var HYPR_UAC_USER = "your-user-here";
+
+var HYPR_UAC_ALLOWED = [
+    /* Disks: mount, eject, power off. Unlocking an encrypted volume still
+     * requires the volume's own passphrase. */
+    "org.freedesktop.udisks2.filesystem-mount-system",
+    "org.freedesktop.udisks2.filesystem-unmount-others",
+    "org.freedesktop.udisks2.eject-media-system",
+    "org.freedesktop.udisks2.power-off-drive-system",
+    "org.freedesktop.udisks2.encrypted-unlock-system",
+    "org.freedesktop.udisks2.modify-drive-settings",
+
+    /* Network connections and their settings. */
+    "org.freedesktop.NetworkManager.settings.modify.system",
+    "org.freedesktop.NetworkManager.reload",
+
+    /* Clock and timezone. */
+    "org.freedesktop.timedate1.set-time",
+    "org.freedesktop.timedate1.set-timezone",
+    "org.freedesktop.timedate1.set-ntp"
+];
+
+polkit.addRule(function (action, subject) {
+    /* Physically present, in the currently active session, and only this
+     * user: an ssh session or a switched-away session gets nothing. */
+    if (!subject.local || !subject.active) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== HYPR_UAC_USER) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (HYPR_UAC_ALLOWED.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+    /* Everything else keeps whatever its own policy says. */
+    return polkit.Result.NOT_HANDLED;
+});

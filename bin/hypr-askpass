@@ -1,0 +1,8 @@
+#!/bin/sh
+# SUDO_ASKPASS / SSH_ASKPASS entry point.
+#
+# sudo normally never reaches this: the yes/no consent prompt in
+# /etc/pam.d/sudo answers first. It is the fallback for when that prompt
+# cannot run (tty, ssh, no Wayland session), and the entry point for ssh's
+# own passphrase and host-key questions. Same window either way.
+exec /usr/local/bin/hypr-uac --mode password "${1:-Password:}"

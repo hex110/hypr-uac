@@ -1,0 +1,103 @@
+#!/bin/sh
+# pam_exec helper for the UAC-style elevation prompt.
+#
+# Two modes, wired as two consecutive auth lines in /etc/pam.d/sudo:
+#
+#   prompt  shows the consent dialog. Exit 0 ("Yes") makes PAM succeed.
+#   denied  exit 0 only if the prompt ended in an explicit "No", which lets
+#           PAM fail immediately instead of falling through to the password
+#           stack. The refusal is remembered for the whole sudo invocation so
+#           that sudo's two remaining auth retries stay silent instead of
+#           asking again.
+#
+# Any other exit is ignored by PAM, so the normal password prompt still runs
+# whenever the dialog cannot be shown (tty, ssh, no Wayland session).
+#
+# pam_exec runs this as the *invoking* user (sudo drops euid during auth) but
+# with a scrubbed environment — no PATH, no session variables — so both are
+# rebuilt here.
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+export PATH
+
+DIALOG=/usr/local/bin/hypr-uac
+DENY_WINDOW=30
+MODE=${1:-prompt}
+
+uid=$(id -u)
+[ "$uid" -ne 0 ] || exit 1
+
+runtime=/run/user/$uid
+[ -d "$runtime" ] || exit 1
+
+# Scoped to this one sudo invocation: pam_exec's parent is the sudo process,
+# and both auth lines are forked from it.
+marker=$runtime/hypr-uac.denied.$PPID
+
+# Fresh refusal recorded by an earlier attempt within this same sudo run?
+refused=false
+if [ -f "$marker" ]; then
+    mtime=$(stat -c %Y "$marker" 2>/dev/null) || mtime=0
+    if [ "$(($(date +%s) - mtime))" -lt "$DENY_WINDOW" ]; then
+        refused=true
+    else
+        rm -f "$marker"
+    fi
+fi
+
+if [ "$MODE" = denied ]; then
+    [ "$refused" = true ] && exit 0
+    exit 1
+fi
+
+# Do not ask twice: sudo retries the auth stack after a refusal.
+[ "$refused" = true ] && exit 1
+
+# Sweep markers left behind by sudo processes that are long gone.
+for stale in "$runtime"/hypr-uac.denied.*; do
+    [ -f "$stale" ] || continue
+    mtime=$(stat -c %Y "$stale" 2>/dev/null) || continue
+    [ "$(($(date +%s) - mtime))" -gt 300 ] && rm -f "$stale"
+done
+
+# A graphical session has to be up, otherwise fall through to the password.
+wayland=
+for sock in "$runtime"/wayland-*; do
+    case $sock in
+        *.lock | *'wayland-*') continue ;;
+    esac
+    [ -S "$sock" ] || continue
+    wayland=${sock##*/}
+    break
+done
+[ -n "$wayland" ] || exit 1
+
+# What is asking. The parent is the sudo (or polkit) process itself.
+command=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null | cut -c1-200)
+[ -n "$command" ] || command="(unknown)"
+
+case $PAM_SERVICE in
+    sudo | sudo-i) detail="A program is asking to run as root." ;;
+    polkit-1)      detail="A program is asking to make system-wide changes." ;;
+    *)             detail="A program is asking for elevated privileges." ;;
+esac
+
+home=$(getent passwd "$uid" | cut -d: -f6)
+
+XDG_RUNTIME_DIR=$runtime \
+WAYLAND_DISPLAY=$wayland \
+DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus \
+GDK_BACKEND=wayland \
+HOME=$home \
+"$DIALOG" --mode confirm \
+    --heading "Allow administrator access?" \
+    --detail "$detail" \
+    --command "$command" </dev/null >/dev/null 2>&1
+rc=$?
+
+[ "$rc" -eq 0 ] && exit 0
+
+# Exit 1 is a deliberate refusal; anything else means the dialog could not
+# ask, and the password stack should still get its turn.
+[ "$rc" -eq 1 ] && : > "$marker"
+exit 1
