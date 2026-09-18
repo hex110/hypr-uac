@@ -23,8 +23,18 @@ elif grep -q 'hypr-uac-pam' "$PAM_SUDO" 2>/dev/null; then
     rm -f "$tmp"
 fi
 
+if [ -f "$HOME/.config/systemd/user/hypr-uac-polkit.service" ]; then
+    say "==> restoring the original polkit agent"
+    systemctl --user disable --now hypr-uac-polkit.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/hypr-uac-polkit.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now hyprpolkitagent.service 2>/dev/null || \
+        say "    could not re-enable hyprpolkitagent; enable an agent yourself"
+fi
+
 say "==> removing binaries"
-sudo rm -f "$PREFIX/bin/hypr-uac" "$PREFIX/bin/hypr-uac-pam"
+sudo rm -f "$PREFIX/bin/hypr-uac" "$PREFIX/bin/hypr-uac-pam" \
+           "$PREFIX/bin/hypr-uac-polkit"
 rm -f "$ASKPASS_DIR/hypr-askpass"
 
 say "Done. Remove the window rules, the SUDO_ASKPASS/SSH_ASKPASS exports and"

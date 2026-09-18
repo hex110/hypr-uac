@@ -79,22 +79,54 @@ Verify:
 sudo -k && sudo id
 ```
 
-## What it does not cover
+## polkit
 
-**polkit.** GUI apps (disk mounting, network settings, vendor tools) authorize
-through polkit, not sudo, and polkit cannot be given this prompt. Both
-`polkitd` and `polkit-agent-helper@.service` run under systemd sandboxing with
-`ProtectHome=yes`, which makes `/home`, `/root` **and `/run/user`**
-inaccessible — so neither can reach your Wayland session to draw anything, by
-spawning a dialog or by handing off to a session daemon over a socket. The
-`polkit.spawn()` hatch in a JS rule is closed for the same reason. Making it
-work means weakening the sandbox on the component that performs
-authentication, which is not a trade this project is willing to recommend.
+GUI apps — disk mounting, network settings, vendor tools — authorize through
+polkit, not sudo. `./install.sh --polkit-agent` replaces `hyprpolkitagent`
+with an agent that uses the same window, so those prompts stop looking like
+they came from a different machine, and say what they are authorizing:
 
-`examples/polkit/` offers the supported alternative: an authorization rule
+<p align="center">
+  <img src="docs/polkit.png" alt="polkit prompt using the same window" width="420">
+</p>
+
+**It is still a password**, deliberately. The consent prompt cannot be moved
+to polkit: `polkit-agent-helper@.service`, which runs the PAM stack, is
+sandboxed with `ProtectHome=yes` — that hides `/home` **and `/run/user`** — so
+it cannot reach your session to draw anything, by spawning a dialog or by
+handing off to a session daemon over a socket. `polkitd` itself runs as its
+own unprivileged user with the same hardening, so the `polkit.spawn()` hatch
+in a JS rule is closed too. Making it work means weakening the sandbox on the
+component that performs authentication, which is not a trade this project
+recommends.
+
+The agent is the one part of polkit's flow that *is* in your session, and it
+is also the only place that knows the action id and message, which PAM never
+receives. That is why it is an agent and not a PAM module.
+
+Two implementation notes, because both cost real time to find:
+
+- Subclassing `PolkitAgent.Listener` from Python **does not work**. Its async
+  vfunc hands you a `user_data` gpointer that PyGI cannot marshal, so it
+  arrives as `None`; passing that back through `Gio.Task` makes
+  libpolkit-agent invoke its callback with `NULL` and segfault. The symptom is
+  misleading — the session reports `gained_authorization=True`, the agent
+  dies, and polkitd logs `FAILED to authenticate`. This agent talks to polkitd
+  over D-Bus directly and uses `PolkitAgent.Session`, which is a plain GObject
+  and fine.
+- The unit deliberately has no `ConditionEnvironment=WAYLAND_DISPLAY`. A unit
+  skipped on an unmet condition stays dead for the whole login instead of
+  retrying, which is exactly how `hyprpolkitagent` ends up silently absent if
+  it starts before the compositor exports its variables. The agent finds the
+  Wayland socket itself.
+
+If you want polkit actions to stop prompting entirely, that is an
+authorization-policy question, not a UI one: `examples/polkit/` has a rule
 making chosen **bounded** actions passwordless for a local, active session,
 while anything granting general-purpose root keeps its password. Read the
 comments — it is promptless, a different trade from the rest of this project.
+
+## What it does not cover
 
 **Your screen lock**, deliberately. **`su`**, untouched.
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=hypr-uac polkit authentication agent
+Documentation=https://github.com/hex110/hypr-uac
+PartOf=graphical-session.target
+After=graphical-session.target
+# Deliberately no ConditionEnvironment=WAYLAND_DISPLAY. A unit skipped on an
+# unmet condition stays dead for the whole login instead of retrying, which is
+# exactly how the agent it replaces ends up silently absent. The agent
+# rediscovers the Wayland socket itself when it needs to show a dialog.
+Conflicts=hyprpolkitagent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hypr-uac-polkit
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

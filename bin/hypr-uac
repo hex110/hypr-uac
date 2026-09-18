@@ -61,6 +61,14 @@ YES_NO_PROMPT = re.compile(r"\(yes/no(/\[fingerprint\])?\)|\(yes/no\)", re.I)
 
 CSS = """
 .uac-icon { -gtk-icon-size: 52px; }
+/* Focus ring on the entry, in the same token the enabled confirm button uses
+   (@accent_bg_color), so the field you must fill and the button you will press
+   read as the same colour rather than the muted disabled one. */
+.uac-password:focus-within {
+    outline: 2px solid @accent_bg_color;
+    outline-offset: -2px;
+    border-color: @accent_bg_color;
+}
 .uac-detail-box {
     font-family: monospace;
     padding: 10px 12px;
@@ -129,6 +137,7 @@ class UacWindow(Adw.ApplicationWindow):
         if args.mode == "password":
             self.entry = Gtk.PasswordEntry(show_peek_icon=True,
                                            activates_default=True)
+            self.entry.add_css_class("uac-password")
             self.entry.set_margin_top(4)
             body.append(self.entry)
 
@@ -150,6 +159,14 @@ class UacWindow(Adw.ApplicationWindow):
         self.set_default_widget(allow)
         (self.entry or allow).grab_focus()
 
+        if self.entry is not None:
+            # Hold the confirm button disabled until something is typed, so
+            # the empty field is the obvious next move rather than a button
+            # that looks ready to press.
+            self.allow = allow
+            allow.set_sensitive(False)
+            self.entry.connect("changed", self.on_entry_changed)
+
         esc = Gtk.ShortcutController()
         esc.add_shortcut(Gtk.Shortcut.new(
             Gtk.ShortcutTrigger.parse_string("Escape"),
@@ -159,7 +176,12 @@ class UacWindow(Adw.ApplicationWindow):
         self.connect("close-request", lambda _w: self.finish(None) or True)
         GLib.timeout_add_seconds(TIMEOUT_SECONDS, lambda: self.finish(None))
 
+    def on_entry_changed(self, entry):
+        self.allow.set_sensitive(bool(entry.get_text()))
+
     def confirm(self):
+        if self.entry is not None and not self.entry.get_text():
+            return
         self.finish(self.entry.get_text() if self.entry else "")
 
     def finish(self, result):
@@ -232,6 +254,8 @@ def main():
     p.add_argument("--heading")
     p.add_argument("--detail")
     p.add_argument("--command")
+    p.add_argument("--icon-name", dest="icon_name",
+                   help="symbolic icon to show; falls back if the theme lacks it")
     p.add_argument("prompt", nargs="?")
     args = p.parse_args()
 
@@ -247,6 +271,13 @@ def main():
     if not args.heading:
         args.heading = ("Allow administrator access?" if args.mode == "confirm"
                         else "Authentication required")
+
+    # polkit hands out icon names that a given theme may not have; an unknown
+    # name renders as a blank slot, so only honour one the theme really has.
+    if args.icon_name:
+        display = Gdk.Display.get_default()
+        if display and Gtk.IconTheme.get_for_display(display).has_icon(args.icon_name):
+            args.icon = args.icon_name
 
     app = UacApp(args)
     try:

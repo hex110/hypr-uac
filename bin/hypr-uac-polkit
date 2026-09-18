@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""hypr-uac-polkit — a polkit authentication agent that uses hypr-uac for its UI.
+
+Replaces hyprpolkitagent so polkit prompts look like the sudo prompt and say
+what they are authorizing.
+
+Why an agent and not a PAM module, which is how the sudo side works: PAM runs
+inside polkit-agent-helper@.service, a system service sandboxed with
+ProtectHome=yes -- which hides /home *and* /run/user -- so it cannot reach the
+session to draw anything. The agent is an ordinary user service with none of
+that, and polkitd hands it the action id, message and icon, which PAM never
+sees. So it is both the only reachable place to draw and the only place that
+knows what the prompt is about.
+
+Why the D-Bus interface is implemented by hand instead of subclassing
+PolkitAgent.Listener: the listener's async vfunc hands Python a `user_data`
+gpointer that PyGI cannot marshal, so it arrives as None. Passing that back
+through Gio.Task makes libpolkit-agent invoke its callback with NULL and
+segfault -- the authentication appears to succeed, the agent dies, and polkitd
+logs "FAILED to authenticate". Talking to polkitd directly avoids the vfunc.
+PolkitAgent.Session is a plain GObject and is used as-is.
+
+This does not remove the password: authentication still goes through
+PolkitAgent.Session -> polkit-agent-helper -> the real PAM stack. Making
+polkit passwordless is an authorization-policy question and belongs in
+/etc/polkit-1/rules.d/ (see examples/polkit/), not here.
+"""
+
+import os
+import signal
+import sys
+
+import gi
+
+gi.require_version("Polkit", "1.0")
+gi.require_version("PolkitAgent", "1.0")
+from gi.repository import Gio, GLib, Polkit, PolkitAgent  # noqa: E402
+
+DIALOG = "/usr/local/bin/hypr-uac"
+OBJECT_PATH = "/org/hyprland/hypruac/AuthenticationAgent"
+PK_NAME = "org.freedesktop.PolicyKit1"
+PK_PATH = "/org/freedesktop/PolicyKit1/Authority"
+PK_IFACE = "org.freedesktop.PolicyKit1.Authority"
+
+AGENT_XML = """
+<node>
+  <interface name='org.freedesktop.PolicyKit1.AuthenticationAgent'>
+    <method name='BeginAuthentication'>
+      <arg type='s' name='action_id' direction='in'/>
+      <arg type='s' name='message' direction='in'/>
+      <arg type='s' name='icon_name' direction='in'/>
+      <arg type='a{ss}' name='details' direction='in'/>
+      <arg type='s' name='cookie' direction='in'/>
+      <arg type='a(sa{sv})' name='identities' direction='in'/>
+    </method>
+    <method name='CancelAuthentication'>
+      <arg type='s' name='cookie' direction='in'/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+def log(*a):
+    print("hypr-uac-polkit:", *a, file=sys.stderr, flush=True)
+
+
+def session_environment():
+    """Environment for the dialog.
+
+    The agent can start before the compositor's variables reach the systemd
+    user environment, so WAYLAND_DISPLAY is rediscovered from the runtime
+    directory rather than assumed. Getting this wrong is how the agent this
+    replaces ends up dead for a whole login.
+    """
+    env = {}
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            for name in sorted(os.listdir(runtime)):
+                if name.startswith("wayland-") and not name.endswith(".lock"):
+                    env["WAYLAND_DISPLAY"] = name
+                    break
+        except OSError:
+            pass
+    return env
+
+
+def pick_identity(identities):
+    """Prefer authenticating as the user running the agent.
+
+    identities arrive as the wire form (kind, {key: variant}); they are turned
+    into Polkit.Identity objects here because that is what Session wants.
+    """
+    mine = None
+    first = None
+    for kind, details in identities:
+        if kind != "unix-user":
+            continue
+        uid = details.get("uid")
+        if uid is None:
+            continue
+        uid = uid.get_uint32() if hasattr(uid, "get_uint32") else int(uid)
+        identity = Polkit.UnixUser.new(uid)
+        first = first or identity
+        if uid == os.getuid():
+            mine = identity
+    return mine or first
+
+
+class Authentication:
+    """One BeginAuthentication call, from prompt to D-Bus reply."""
+
+    def __init__(self, agent, invocation, action_id, message, icon_name,
+                 identity, cookie):
+        self.agent = agent
+        self.invocation = invocation
+        self.action_id = action_id
+        self.message = message or "Authentication is required"
+        self.icon_name = icon_name
+        self.cookie = cookie
+        self.last_error = None
+        self.finished = False
+
+        self.session = PolkitAgent.Session.new(identity, cookie)
+        self.session.connect("request", self.on_request)
+        self.session.connect("completed", self.on_completed)
+        self.session.connect("show-error", self.on_show_error)
+        self.session.connect("show-info", self.on_show_info)
+        self.session.initiate()
+
+    def detail_for(self, prompt):
+        """Subtitle: polkit's last error if there was one, else the prompt --
+        but not when the prompt is just "Password", which the entry says."""
+        if self.last_error:
+            return self.last_error
+        text = prompt.strip().rstrip(":").strip()
+        return "" if text.lower() in ("password", "password for root") else text
+
+    def on_request(self, _session, prompt, echo_on):
+        # echo_on means the answer is not a secret (a token, a PIN pad). The
+        # dialog masks either way.
+        del echo_on
+        argv = [
+            DIALOG, "--mode", "password",
+            "--heading", self.message,
+            "--detail", self.detail_for(prompt),
+            "--command", self.action_id,
+        ]
+        if self.icon_name:
+            argv += ["--icon-name", self.icon_name]
+        launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE)
+        for key, value in session_environment().items():
+            launcher.setenv(key, value, True)
+        try:
+            proc = launcher.spawnv(argv)
+        except GLib.Error as exc:
+            log("cannot start the dialog:", exc)
+            self.cancel()
+            return
+        proc.communicate_utf8_async(None, None, self.on_dialog_done, None)
+
+    def on_dialog_done(self, proc, res, _data):
+        try:
+            _ok, stdout, _stderr = proc.communicate_utf8_finish(res)
+        except GLib.Error as exc:
+            log("dialog failed:", exc)
+            self.cancel()
+            return
+        if proc.get_exit_status() != 0:
+            # Refused, dismissed, timed out, or could not be shown.
+            self.cancel()
+            return
+        self.session.response((stdout or "").rstrip("\n"))
+
+    def on_show_error(self, _session, text):
+        # Carried into the next prompt rather than a dialog of its own, so a
+        # mistyped password stays one window.
+        self.last_error = text
+
+    def on_show_info(self, _session, text):
+        log("info:", text)
+
+    def on_completed(self, _session, gained_authorization):
+        log("completed:", self.action_id,
+            "authorized" if gained_authorization else "not authorized")
+        self.finish()
+
+    def cancel(self):
+        if not self.finished:
+            self.session.cancel()
+
+    def finish(self):
+        """Reply to polkitd. The reply only says the agent is done; polkitd
+        learns the outcome from the helper, which reports it directly."""
+        if self.finished:
+            return
+        self.finished = True
+        self.agent.forget(self.cookie)
+        self.invocation.return_value(None)
+
+
+class Agent:
+    def __init__(self, connection, session_id):
+        self.connection = connection
+        self.session_id = session_id
+        self.active = {}
+        info = Gio.DBusNodeInfo.new_for_xml(AGENT_XML).interfaces[0]
+        # register_object is deprecated in newer PyGI; the closures variant is
+        # the replacement, but is not present everywhere yet.
+        register = getattr(connection, "register_object_with_closures2", None)
+        if register is None:
+            register = connection.register_object
+        self.reg_id = register(OBJECT_PATH, info, self.on_method_call,
+                               None, None)
+
+    def forget(self, cookie):
+        self.active.pop(cookie, None)
+
+    @property
+    def subject(self):
+        return GLib.Variant("(sa{sv})", (
+            "unix-session", {"session-id": GLib.Variant("s", self.session_id)}))
+
+    def register(self):
+        self.connection.call_sync(
+            PK_NAME, PK_PATH, PK_IFACE, "RegisterAuthenticationAgent",
+            GLib.Variant("((sa{sv})ss)", (
+                ("unix-session",
+                 {"session-id": GLib.Variant("s", self.session_id)}),
+                os.environ.get("LANG", "en_US.UTF-8"),
+                OBJECT_PATH)),
+            None, Gio.DBusCallFlags.NONE, -1, None)
+
+    def unregister(self):
+        try:
+            self.connection.call_sync(
+                PK_NAME, PK_PATH, PK_IFACE, "UnregisterAuthenticationAgent",
+                GLib.Variant("((sa{sv})s)", (
+                    ("unix-session",
+                     {"session-id": GLib.Variant("s", self.session_id)}),
+                    OBJECT_PATH)),
+                None, Gio.DBusCallFlags.NONE, -1, None)
+        except GLib.Error as exc:
+            log("unregister failed:", exc)
+
+    def on_method_call(self, _conn, _sender, _path, _iface, method, params,
+                       invocation):
+        if method == "BeginAuthentication":
+            action_id, message, icon_name, _details, cookie, identities = params
+            identity = pick_identity(identities)
+            if identity is None:
+                log("no usable identity for", action_id)
+                invocation.return_value(None)
+                return
+            self.active[cookie] = Authentication(
+                self, invocation, action_id, message, icon_name, identity,
+                cookie)
+        elif method == "CancelAuthentication":
+            (cookie,) = params
+            auth = self.active.get(cookie)
+            if auth is not None:
+                auth.cancel()
+            invocation.return_value(None)
+        else:
+            invocation.return_error_literal(
+                Gio.dbus_error_quark(), Gio.DBusError.UNKNOWN_METHOD, method)
+
+
+def main():
+    subject = Polkit.UnixSession.new_for_process_sync(os.getpid(), None)
+    if subject is None:
+        log("no logind session for this process; refusing to register")
+        return 1
+    session_id = subject.get_session_id()
+
+    connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    agent = Agent(connection, session_id)
+    try:
+        agent.register()
+    except GLib.Error as exc:
+        log("could not register as the authentication agent for session "
+            f"{session_id}: {exc.message}")
+        log("another agent (hyprpolkitagent?) probably holds this session")
+        return 1
+
+    log("registered for session", session_id)
+    loop = GLib.MainLoop()
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except (ValueError, ImportError):
+        add_signal = GLib.unix_signal_add
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        add_signal(GLib.PRIORITY_DEFAULT, sig, lambda: (loop.quit(), True)[1])
+    try:
+        loop.run()
+    finally:
+        agent.unregister()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
