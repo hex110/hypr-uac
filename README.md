@@ -48,7 +48,10 @@ auth [success=die  default=ignore] pam_exec.so quiet /usr/local/bin/hypr-uac-pam
 - **No** → the helper records the refusal, the second line turns it into `die`,
   and sudo fails at once instead of falling through to a password prompt.
 - **Anything else** — tty, ssh, Hyprland not running, toolkit failure — both
-  lines are `ignore`d and your normal password stack runs untouched.
+  lines are `ignore`d and your normal password stack runs untouched. An ssh
+  caller is recognised by `SSH_CONNECTION` in sudo's ancestry, since a logged-in
+  desktop would otherwise get a dialog nobody is in front of — one that times
+  out as a refusal and leaves the ssh user with no password prompt at all.
 
 That last point is the safety property: **a broken or missing dialog cannot
 lock you out**, because failure means "fall through", not "deny". If you change

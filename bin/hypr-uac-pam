@@ -11,7 +11,8 @@
 #           asking again.
 #
 # Any other exit is ignored by PAM, so the normal password prompt still runs
-# whenever the dialog cannot be shown (tty, ssh, no Wayland session).
+# whenever the dialog cannot be shown (tty, no Wayland session) or the caller
+# is an ssh session, where nobody may be at the screen to click it.
 #
 # pam_exec runs this as the *invoking* user (sudo drops euid during auth) but
 # with a scrubbed environment — no PATH, no session variables — so both are
@@ -71,6 +72,18 @@ for sock in "$runtime"/wayland-*; do
     break
 done
 [ -n "$wayland" ] || exit 1
+
+# A running desktop does not mean anyone is in front of it: sudo over ssh
+# would pop the dialog on the remote machine's screen, time out, and count as
+# a refusal. Walk up from sudo looking for an ssh session; sudo's own environ
+# is root's and unreadable, which simply moves the walk on to its caller.
+pid=$PPID
+while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    if { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | grep -q '^SSH_CONNECTION='; then
+        exit 1
+    fi
+    pid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
+done
 
 # What is asking. The parent is the sudo (or polkit) process itself.
 command=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null | cut -c1-200)
