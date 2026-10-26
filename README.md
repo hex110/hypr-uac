@@ -82,6 +82,30 @@ Verify:
 sudo -k && sudo id
 ```
 
+## Themes
+
+By default the dialog follows your GTK/libadwaita theme. To override it, put a
+stylesheet at `~/.config/hypr-uac/themes/<name>.css` and its name in
+`~/.config/hypr-uac/theme` (or set `HYPR_UAC_THEME` to a name or an absolute
+path to try one out). `system` or `none` means no custom stylesheet. Plain
+GTK4 CSS, `@define-color` overrides included; see `examples/themes/classic.css`.
+
+A missing or unparsable theme never blocks the prompt: parse errors go to
+stderr and the dialog falls back to the system look.
+
+To have a colour engine drive it, `examples/matugen/hypr-uac.css` is a matugen
+template. Register it in `~/.config/matugen/config.toml` (dms runs that file on
+every palette change) and select `dank`:
+
+```toml
+[templates.hypr_uac]
+input_path = "~/.config/matugen/templates/hypr-uac.css"
+output_path = "~/.config/hypr-uac/themes/dank.css"
+```
+
+No reload hook is needed: every dialog is a new process and reads the file at
+launch.
+
 ## polkit
 
 GUI apps — disk mounting, network settings, vendor tools — authorize through

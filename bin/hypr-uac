@@ -19,6 +19,10 @@ Exit codes, which the PAM helper depends on telling apart:
   2  could not ask — no display, toolkit failure; the caller should fall
      back to its own password prompt rather than treat this as a refusal.
 
+Themes: ~/.config/hypr-uac/theme names a stylesheet in
+~/.config/hypr-uac/themes/<name>.css, loaded over the system theme. See
+load_theme(); a missing or broken theme never stops the dialog from asking.
+
 A real xdg_toplevel, so Hyprland can float it like any other window rather
 than it being an always-on-top layer surface. GTK4 + libadwaita means it
 inherits the system colour-scheme, font and ~/.config/gtk-4.0/gtk.css, which
@@ -28,6 +32,7 @@ profile changes, with no colours hardcoded here.
 
 import argparse
 import os
+import pwd
 import re
 import sys
 
@@ -76,6 +81,59 @@ CSS = """
     background-color: alpha(currentColor, 0.06);
 }
 """
+
+
+def config_dir():
+    """The invoking user's config dir. PAM scrubs the environment, so fall
+    back to the passwd entry rather than trusting $HOME or $XDG_CONFIG_HOME."""
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base:
+        home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+        base = os.path.join(home, ".config")
+    return os.path.join(base, "hypr-uac")
+
+
+def theme_path():
+    """Resolve the selected theme to a file, or None for the plain system look.
+
+    $HYPR_UAC_THEME wins (a name, or an absolute path), then the first line of
+    <config>/theme. "system" and "none" both mean no custom stylesheet.
+    """
+    root = config_dir()
+    choice = os.environ.get("HYPR_UAC_THEME", "").strip()
+    if not choice:
+        try:
+            with open(os.path.join(root, "theme")) as fh:
+                choice = fh.readline().strip()
+        except OSError:
+            return None
+    if not choice or choice in ("system", "none"):
+        return None
+    if os.path.isabs(choice):
+        return choice
+    if "/" in choice or choice.startswith("."):
+        return None
+    return os.path.join(root, "themes", choice + ".css")
+
+
+def load_theme(display):
+    path = theme_path()
+    if not path or not os.path.isfile(path):
+        return
+    provider = Gtk.CssProvider()
+    # A theme that does not parse should degrade to the system look, not stop
+    # the prompt: this is the auth gate, and 2 ("could not ask") is for real
+    # failures. GTK keeps whatever parsed before the error.
+    provider.connect("parsing-error", lambda _p, section, err: print(
+        f"hypr-uac: theme {path}: {section.to_string()}: {err.message}",
+        file=sys.stderr))
+    try:
+        provider.load_from_path(path)
+    except GLib.Error as exc:
+        print(f"hypr-uac: theme {path}: {exc.message}", file=sys.stderr)
+        return
+    Gtk.StyleContext.add_provider_for_display(
+        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
 
 
 class UacWindow(Adw.ApplicationWindow):
@@ -211,6 +269,7 @@ class UacApp(Adw.Application):
         if display:
             Gtk.StyleContext.add_provider_for_display(
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            load_theme(display)
         UacWindow(self, self.args).present()
         self.presented = True
 
