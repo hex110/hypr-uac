@@ -71,12 +71,40 @@ cd hypr-uac
 ```
 
 The installer backs up `/etc/pam.d/sudo`, inserts the two lines above the
-existing stack without replacing it, and is safe to re-run. Two manual steps
-are printed at the end: the window rules, and the askpass exports.
+existing stack without replacing it, and is safe to re-run. It also:
+
+- sets `SUDO_ASKPASS` and `SSH_ASKPASS` in
+  `~/.config/environment.d/50-hypr-uac.conf`, **not** in a shell rc file. Your
+  desktop session usually never runs your interactive shell, so an export in
+  `~/.bashrc` or `config.fish` reaches terminals and nothing else. GUI apps
+  that fall back to `sudo -A` then report that no password prompt is
+  available. environment.d is read by the systemd user manager, so it covers
+  services, D-Bus-activated apps, and a Hyprland started through uwsm. If you
+  start Hyprland some other way, also add `examples/hyprland/env.lua` (or
+  `env.conf`).
+- installs the polkit agent and enables it in place of `hyprpolkitagent` (see
+  [polkit](#polkit)). Pass `--no-polkit-agent` to keep the agent you have.
+
+The window rules are the one manual step left; the installer prints where they
+are.
 
 Uninstall with `./uninstall.sh`, which restores the backup first.
 
-Verify:
+## Checking an install
+
+```sh
+hypr-uac-doctor
+```
+
+It changes nothing. It checks that the PAM lines sit above your password stack,
+that the askpass variables reach the systemd session **and an app launched by
+Hyprland** (not your terminal, which is where an rc-file export would fool
+you), that exactly one polkit agent is registered, and that the window rules
+exist. It also reports a locked login keyring, but doesn't fix it: unlocking
+the keyring is your login stack's job, not sudo's. The installer runs it at the
+end; run it again whenever something that should prompt does not.
+
+To try it by hand:
 
 ```sh
 sudo -k && sudo id
@@ -109,7 +137,8 @@ launch.
 ## polkit
 
 GUI apps — disk mounting, network settings, vendor tools — authorize through
-polkit, not sudo. `./install.sh --polkit-agent` replaces `hyprpolkitagent`
+polkit, not sudo, and most of them try `pkexec` first. With no agent
+registered, `pkexec` just exits 127. `./install.sh` replaces `hyprpolkitagent`
 with an agent that uses the same window, so those prompts stop looking like
 they came from a different machine, and say what they are authorizing:
 

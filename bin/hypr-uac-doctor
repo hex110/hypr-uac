@@ -1,0 +1,148 @@
+#!/bin/sh
+# hypr-uac-doctor -- check that every path into the dialog is actually wired.
+#
+# Read-only: it changes nothing. Each problem it reports has bitten a real
+# install, and most of them are invisible from a terminal, because a terminal's
+# shell has read your rc files and the desktop session has not.
+#
+# Exit status: 0 if nothing failed (warnings allowed), 1 otherwise.
+
+PREFIX=${PREFIX:-/usr/local}
+ASKPASS_DIR=${ASKPASS_DIR:-$HOME/.local/bin}
+PAM_SUDO=${PAM_SUDO:-/etc/pam.d/sudo}
+ENV_FILE=${ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/50-hypr-uac.conf}
+ASKPASS=$ASKPASS_DIR/hypr-askpass
+
+failed=0
+ok()   { printf '  ok    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*"; }
+fail() { printf '  FAIL  %s\n' "$*"; failed=1; }
+hint() { printf '        %s\n' "$*"; }
+section() { printf '\n%s\n' "$*"; }
+
+section "Binaries"
+for f in "$PREFIX/bin/hypr-uac" "$PREFIX/bin/hypr-uac-pam" "$ASKPASS"; do
+    if [ -x "$f" ]; then ok "$f"; else fail "$f missing or not executable"; fi
+done
+
+section "sudo ($PAM_SUDO)"
+if [ ! -r "$PAM_SUDO" ]; then
+    fail "cannot read $PAM_SUDO"
+else
+    # The consent lines only work above the password stack: below it, the
+    # password is asked for first and the dialog never gets a turn.
+    first_auth=$(grep -E '^[[:space:]]*auth[[:space:]]' "$PAM_SUDO" | head -n 1)
+    if ! grep -q 'hypr-uac-pam.*prompt' "$PAM_SUDO"; then
+        fail "consent prompt not wired; sudo will always ask for a password"
+        hint "re-run ./install.sh"
+    elif ! grep -q 'hypr-uac-pam.*denied' "$PAM_SUDO"; then
+        fail "'prompt' line present but 'denied' line missing; No falls through to a password"
+    else
+        case $first_auth in
+            *hypr-uac-pam*prompt*) ok "consent prompt wired above the password stack" ;;
+            *) fail "hypr-uac lines are not the first auth lines, so the password is asked first" ;;
+        esac
+    fi
+fi
+
+section "Askpass (sudo -A fallback, ssh)"
+# A terminal is the one place this is not worth checking: an rc-file export
+# shows up there and nowhere else. The session is what GUI apps inherit.
+sd_val=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^SUDO_ASKPASS=//p')
+if [ -f "$ENV_FILE" ]; then ok "$ENV_FILE present"; else warn "$ENV_FILE missing"; fi
+if [ -n "$sd_val" ]; then
+    ok "systemd user session: SUDO_ASKPASS=$sd_val"
+    [ -x "$sd_val" ] || fail "SUDO_ASKPASS points at $sd_val, which is not executable"
+else
+    warn "systemd user session has no SUDO_ASKPASS (services and D-Bus-activated apps won't have it)"
+fi
+
+hypr_env=
+if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null 2>&1; then
+    # Ask Hyprland to spawn something and look at what it actually got.
+    # /proc/<Hyprland>/environ is no use: it is the environment Hyprland
+    # started with, and does not show anything set later through env rules.
+    tmp=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/hypr-uac-doctor.XXXXXX")
+    cmd="env > $tmp"
+    out=$(hyprctl dispatch exec "sh -c '$cmd'" 2>&1)
+    case $out in
+        *rror*) hyprctl eval "hl.exec_cmd(\"sh -c '$cmd'\")" >/dev/null 2>&1 ;;
+    esac
+    i=0
+    while [ ! -s "$tmp" ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    if [ -s "$tmp" ]; then
+        hypr_env=$(sed -n 's/^SUDO_ASKPASS=//p' "$tmp")
+        hypr_ssh=$(sed -n 's/^SSH_ASKPASS=//p' "$tmp")
+        rm -f "$tmp"
+        if [ -n "$hypr_env" ]; then
+            ok "apps launched by Hyprland: SUDO_ASKPASS=$hypr_env"
+        else
+            fail "apps launched by Hyprland have no SUDO_ASKPASS"
+            hint "GUI apps that fall back to 'sudo -A' will say no prompt is available."
+            hint "Exports in ~/.bashrc / config.fish only reach terminals. If Hyprland"
+            hint "is not started through systemd (uwsm), add examples/hyprland/env.lua"
+            hint "(or env.conf) to your Hyprland config."
+        fi
+        [ -n "$hypr_ssh" ] || warn "apps launched by Hyprland have no SSH_ASKPASS"
+    else
+        rm -f "$tmp"
+        warn "could not get Hyprland to spawn a test process; skipped"
+    fi
+else
+    warn "not inside a Hyprland session; skipped the check of what apps inherit"
+fi
+
+section "polkit (pkexec, GUI admin prompts)"
+# Known agents, so a second one can be spotted. Only one may hold a session.
+others=$(pgrep -a -f 'hyprpolkitagent|polkit-gnome-authentication-agent|polkit-kde-authentication-agent|lxpolkit|mate-polkit|polkit-mate-authentication-agent|xfce-polkit|soteria' 2>/dev/null \
+    | grep -v -e hypr-uac -e pgrep | sed 's/^[0-9]* //')
+if systemctl --user is-active --quiet hypr-uac-polkit.service 2>/dev/null; then
+    ok "hypr-uac-polkit.service active"
+    if journalctl --user -u hypr-uac-polkit.service -b --no-pager 2>/dev/null | grep -q 'registered for session'; then
+        ok "agent registered with polkitd"
+    else
+        warn "agent running but no 'registered for session' in this boot's log"
+    fi
+    [ -z "$others" ] || warn "another agent is also running: $others"
+elif [ -n "$others" ]; then
+    ok "a different agent is running: $others"
+    hint "pkexec works, but in that agent's window. ./install.sh replaces it."
+else
+    fail "no polkit agent running; pkexec from GUI apps fails with exit 127"
+    hint "re-run ./install.sh (it installs and enables hypr-uac-polkit)"
+fi
+hint "polkit always asks for the password, in the same window, and gives up"
+hint "after 60s; an unanswered prompt also shows up as exit 127."
+
+section "Window rules"
+hypr_conf=${XDG_CONFIG_HOME:-$HOME/.config}/hypr
+if grep -rqs 'hypr-uac' "$hypr_conf" 2>/dev/null; then
+    ok "hypr-uac rules found under $hypr_conf"
+else
+    warn "no hypr-uac window rules under $hypr_conf; the dialog will tile"
+    hint "add examples/hyprland/windowrules.lua (or .conf)"
+fi
+
+section "Login keyring (advisory; hypr-uac does not manage this)"
+locked=$(busctl --user get-property org.freedesktop.secrets \
+    /org/freedesktop/secrets/collection/login org.freedesktop.Secret.Collection Locked 2>/dev/null)
+case $locked in
+    "b false") ok "login keyring unlocked" ;;
+    "b true")
+        warn "login keyring is locked, so apps will ask for a password to unlock it"
+        hint "Unlocking happens in your login PAM stack, not sudo's: whichever"
+        hint "service authenticated you (greeter, or the lock screen's) needs"
+        hint "pam_gnome_keyring. Confirm which one is live before editing it."
+        ;;
+    *) ok "no Secret Service login collection; nothing to check" ;;
+esac
+
+printf '\n'
+if [ $failed -eq 0 ]; then
+    echo "No failures."
+    echo "Live test:  sudo -k && sudo id      (consent dialog)"
+    echo "            pkexec true             (polkit, password)"
+else
+    echo "Some checks failed; see above."
+fi
+exit $failed

@@ -7,14 +7,17 @@
 # ignores it and your password stack runs as before.
 set -eu
 
-WITH_POLKIT_AGENT=0
+# The polkit agent is on by default: GUI apps that need root mostly try pkexec
+# first, and with no agent registered pkexec just exits 127.
+WITH_POLKIT_AGENT=1
 for arg in "$@"; do
     case $arg in
-        --polkit-agent) WITH_POLKIT_AGENT=1 ;;
+        --polkit-agent) WITH_POLKIT_AGENT=1 ;;  # the default; kept for old scripts
+        --no-polkit-agent) WITH_POLKIT_AGENT=0 ;;
         -h|--help)
-            echo "usage: $0 [--polkit-agent]"
-            echo "  --polkit-agent  also replace hyprpolkitagent, so polkit"
-            echo "                  prompts use the same window (still a password)"
+            echo "usage: $0 [--no-polkit-agent]"
+            echo "  --no-polkit-agent  keep your current polkit agent instead of"
+            echo "                     replacing it with hypr-uac-polkit"
             exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 1 ;;
     esac
@@ -23,6 +26,7 @@ done
 PREFIX=${PREFIX:-/usr/local}
 ASKPASS_DIR=${ASKPASS_DIR:-$HOME/.local/bin}
 UNIT_DIR=${UNIT_DIR:-$HOME/.config/systemd/user}
+ENV_FILE=${ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/50-hypr-uac.conf}
 PAM_SUDO=${PAM_SUDO:-/etc/pam.d/sudo}
 BACKUP_DIR=$PREFIX/share/hypr-uac
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -42,10 +46,30 @@ say "==> installing the dialog and PAM helper into $PREFIX/bin"
 sudo install -d -m 755 "$PREFIX/bin" "$BACKUP_DIR"
 sudo install -o root -g root -m 755 "$SRC/bin/hypr-uac"     "$PREFIX/bin/hypr-uac"
 sudo install -o root -g root -m 755 "$SRC/bin/hypr-uac-pam" "$PREFIX/bin/hypr-uac-pam"
+sudo install -o root -g root -m 755 "$SRC/bin/hypr-uac-doctor" "$PREFIX/bin/hypr-uac-doctor"
 
 say "==> installing the askpass shim into $ASKPASS_DIR"
 install -d -m 755 "$ASKPASS_DIR"
 install -m 755 "$SRC/bin/hypr-askpass" "$ASKPASS_DIR/hypr-askpass"
+
+# Session-wide, not a shell rc file: the desktop session usually never runs
+# your interactive shell, so an export in ~/.bashrc or config.fish reaches
+# terminals and nothing else -- and GUI apps that fall back to `sudo -A` then
+# report that no password prompt is available. environment.d is read by the
+# systemd user manager, so it reaches services, D-Bus-activated apps and a
+# Hyprland started through uwsm. A Hyprland started some other way needs
+# examples/hyprland/env.lua as well; hypr-uac-doctor tells you which you have.
+say "==> setting SUDO_ASKPASS / SSH_ASKPASS in $ENV_FILE"
+install -d -m 755 "$(dirname -- "$ENV_FILE")"
+cat > "$ENV_FILE" <<ENV
+# Written by hypr-uac's install.sh; removed by uninstall.sh.
+SUDO_ASKPASS=$ASKPASS_DIR/hypr-askpass
+SSH_ASKPASS=$ASKPASS_DIR/hypr-askpass
+ENV
+# environment.d is only read when the user manager starts; this covers the
+# rest of the current login.
+systemctl --user set-environment \
+    "SUDO_ASKPASS=$ASKPASS_DIR/hypr-askpass" "SSH_ASKPASS=$ASKPASS_DIR/hypr-askpass" 2>/dev/null || true
 
 if [ "$WITH_POLKIT_AGENT" -eq 1 ]; then
     say "==> installing the polkit agent"
@@ -83,27 +107,26 @@ else
     rm -f "$tmp"
 fi
 
+say ""
+say "Installed."
+if ! grep -rqs 'hypr-uac' "${XDG_CONFIG_HOME:-$HOME/.config}/hypr"; then
+    cat <<NOTE
+One manual step remains:
+
+  Window rules -- hypr-uac is a normal toplevel, so Hyprland will tile it
+  unless you add the rules from:
+      examples/hyprland/windowrules.lua   (Lua config)
+      examples/hyprland/windowrules.conf  (hyprlang config)
+NOTE
+fi
+
 cat <<NOTE
-
-Installed. Two manual steps remain:
-
-1. Window rules -- hypr-uac is a normal toplevel, so Hyprland will tile it
-   unless you add the rules from:
-       examples/hyprland/windowrules.lua   (Lua config)
-       examples/hyprland/windowrules.conf  (hyprlang config)
-
-2. Askpass, so the fallback and ssh use the same window. Add to your shell:
-       export SUDO_ASKPASS=$ASKPASS_DIR/hypr-askpass
-       export SSH_ASKPASS=$ASKPASS_DIR/hypr-askpass
-   (fish: set -gx SUDO_ASKPASS $ASKPASS_DIR/hypr-askpass)
-   Leave SSH_ASKPASS_REQUIRE unset unless you want ssh to prefer the dialog
-   over your terminal.
 
 Optional: examples/polkit/ makes chosen polkit actions passwordless. Read the
 comments first -- it is a different, promptless trade-off.
 
-Re-run with --polkit-agent to also route polkit prompts through this window.
-
-Test with:  sudo -k && sudo id
-If the dialog never appears, the password prompt still works; nothing is lost.
+Running hypr-uac-doctor to check the result. Run it again any time something
+that should prompt does not.
 NOTE
+
+"$PREFIX/bin/hypr-uac-doctor" || true

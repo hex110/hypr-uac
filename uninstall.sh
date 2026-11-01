@@ -6,6 +6,7 @@ set -eu
 PREFIX=${PREFIX:-/usr/local}
 ASKPASS_DIR=${ASKPASS_DIR:-$HOME/.local/bin}
 PAM_SUDO=${PAM_SUDO:-/etc/pam.d/sudo}
+ENV_FILE=${ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/50-hypr-uac.conf}
 BACKUP_DIR=$PREFIX/share/hypr-uac
 
 say() { printf '%s\n' "$*"; }
@@ -32,10 +33,17 @@ if [ -f "$HOME/.config/systemd/user/hypr-uac-polkit.service" ]; then
         say "    could not re-enable hyprpolkitagent; enable an agent yourself"
 fi
 
+if [ -f "$ENV_FILE" ]; then
+    say "==> removing $ENV_FILE"
+    rm -f "$ENV_FILE"
+    systemctl --user unset-environment SUDO_ASKPASS SSH_ASKPASS 2>/dev/null || true
+fi
+
 say "==> removing binaries"
 sudo rm -f "$PREFIX/bin/hypr-uac" "$PREFIX/bin/hypr-uac-pam" \
-           "$PREFIX/bin/hypr-uac-polkit"
+           "$PREFIX/bin/hypr-uac-polkit" "$PREFIX/bin/hypr-uac-doctor"
 rm -f "$ASKPASS_DIR/hypr-askpass"
 
-say "Done. Remove the window rules, the SUDO_ASKPASS/SSH_ASKPASS exports and"
-say "any /etc/polkit-1/rules.d/49-hypr-uac-desktop.rules by hand."
+say "Done. Remove the window rules, any SUDO_ASKPASS/SSH_ASKPASS lines you added"
+say "to your Hyprland config or shell, and any"
+say "/etc/polkit-1/rules.d/49-hypr-uac-desktop.rules by hand."
